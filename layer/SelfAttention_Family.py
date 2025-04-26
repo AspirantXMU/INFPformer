@@ -75,3 +75,54 @@ class ProbAttention(nn.Module):
             assert (L_Q == L_V)  # requires that L_Q == L_V, i.e. for self-attention only
             contex = V.cumsum(dim=-2)
         return contex
+    
+    def _update_context(self, context_in, V, scores, index, L_Q, attn_mask): # update the context with selected value
+        B, H, L_V, D = V.shape
+
+        if self.mask_flag:
+            attn_mask = ProbMask(B, H, L_Q, index, scores, device=V.device)
+            scores.masked_fill_(attn_mask.mask, -np.inf)
+
+        attn = torch.softmax(scores, dim=-1)  # nn.Softmax(dim=-1)(scores)
+
+        context_in[torch.arange(B)[:, None, None], 
+                   torch.arange(H)[None, :, None], index, :] = torch.matmul(attn, V).type_as(context_in)
+        if self.output_attention:
+            attns = (torch.ones([B, H, L_V, L_V]) / L_V).type_as(attn).to(attn.device)
+            attns[torch.arange(B)[:, None, None], torch.arange(H)[None, :, None], index, :] = attn
+            return (context_in, attns)
+        else:
+            return (context_in, None)
+        
+    def forward(self, queries, keys, values, attn_mask, tau=None, delta=None):
+        B, L_Q, H, D = queries.shape
+        _, L_K, _, _ = keys.shape
+        
+
+        queries = queries.transpose(2, 1)
+        keys = keys.transpose(2, 1)
+        values = values.transpose(2, 1)
+
+        U_part = self.factor * \
+              np.ceil(np.log(L_K)).astype('int').item() # c*ln(L_k)
+
+        u = self.factor * \
+              np.ceil(np.log(L_Q)).astype('int').item()  # c*ln(L_q)
+        
+        U_part = U_part if U_part < L_K else L_K
+        u = u if u < L_Q else L_Q
+
+        scores_top, index = self._prob_QK(queries, keys, sample_k=U_part, n_top=u)
+        
+        #add scale factor
+        scale = self.scale or 1. / sqrt(D)
+        if scale is not None:
+            scores_top = scores_top * scale
+        #get the context
+        context = self._get_initial_context(values, L_Q)
+        #update the context with selected top_k queries
+        context, attn = self._update_context(context, values, scores_top, index, L_Q, attn_mask)
+        
+        return context.contiguous(), attn
+    
+    
